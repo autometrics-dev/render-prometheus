@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+
+"""
+Prometheus configuration generator
+
+This script generates a prometheus configuration following environment variables and command-line flags.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from typing import Dict, Any, Tuple
+import urllib.parse
+import yaml
+
+
+VAR_NAME_PREFIX = "PROM_TARGET_"
+CONF_EXTERNAL_LABELS = "external_labels"
+CONF_MONITOR = "monitor"
+CONF_SCRAPE_CONFIGS = "scrape_configs"
+CONF_SCRAPE_INTERVAL = "scrape_interval"
+CONF_SCRAPE_TIMEOUT = "scrape_timeout"
+CONF_STATIC_CONFIGS = "static_configs"
+CONF_RULE_FILES = "rule_files"
+CONF_GLOBAL = "global"
+CONF_TARGETS = "targets"
+CONF_JOB_NAME = "job_name"
+
+
+def default_config() -> Dict[str, Any]:
+    config = {}
+    config[CONF_RULE_FILES] = ["/etc/prometheus/rules/*.yml"]
+    config[CONF_GLOBAL] = {
+        CONF_SCRAPE_INTERVAL: "10s",
+        CONF_SCRAPE_TIMEOUT: "5s",
+        CONF_EXTERNAL_LABELS: {CONF_MONITOR: "autometrics"},
+    }
+    return config
+
+
+def add_scrape_config(config: Dict[str, Any], name: str, target: str) -> Dict[str, Any]:
+    if config.get(CONF_SCRAPE_CONFIGS) is None:
+        config[CONF_SCRAPE_CONFIGS] = []
+    config[CONF_SCRAPE_CONFIGS].append(
+        {CONF_JOB_NAME: name.lower(), CONF_STATIC_CONFIGS: [{CONF_TARGETS: [target]}]}
+    )
+    return config
+
+
+def parse_target(var_name: str, var_value: str) -> Tuple[str, str]:
+    if not var_name.startswith(VAR_NAME_PREFIX):
+        raise ValueError(
+            f"{var_name} is not a valid environment variable (does not start with {VAR_NAME_PREFIX})."
+        )
+    try:
+        urllib.parse.urlsplit("//" + var_value)
+    except ValueError as e:
+        raise ValueError(f"{var_value} is not a valid IP address: {e}")
+
+    return (var_name.removeprefix(VAR_NAME_PREFIX), var_value)
+
+
+def generate_prometheus_yml() -> str:
+    config = default_config()
+    for key in os.environ:
+        if key.startswith(VAR_NAME_PREFIX):
+            target_name, target_location = parse_target(key, os.environ[key])
+            config = add_scrape_config(config, target_name, target_location)
+    return yaml.dump(config)
+
+
+def create_folders():
+    try:
+        os.mkdir("/etc")
+    except FileExistsError:
+        pass
+
+    try:
+        os.mkdir("/etc/prometheus")
+    except FileExistsError:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    # TODO: add arguments to do a bunch of things:
+    # - Whether to activate or not the web.enable-admin-ui
+    # - The port to listen to should be configurable instead of env only
+    # - A way to add a listener to reload config on change
+    # - A way to read the targets from watched file rather than environment variables
+    # - A way to choose the directory where the prometheus.yml should be created
+    # - Scrape interval and timeout
+    # - The name of the monitor in the added labels
+    # - Authentication parameters (both to connect to Prometheus, and for Prometheus to connect to targets)
+    # - Rule files list appending
+    # - Alerting rules appending
+    args = parser.parse_args()
+    config = generate_prometheus_yml()
+    create_folders()
+    with open("/etc/prometheus/prometheus.yml", "w") as f:
+        f.write(config)
+    port = os.environ.get("PORT", 9090)
+    subprocess.run(
+        [
+            "prometheus",
+            "--config.file=/etc/prometheus/prometheus.yml",
+            f"--web.listen-address=:{port}",
+        ],
+        check=True,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+
+
+if __name__ == "__main__":
+    main()
