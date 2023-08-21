@@ -43,10 +43,17 @@ This service will only work with scraping metrics for now, as it's the
 recommended way to deal with long running services, notably to have
 better uptime metrics and control data usage.
 
+
+## TODO
+
+- [ ] Set up [file-based service discovery](https://prometheus.io/docs/guides/file-sd/#use-file-based-service-discovery-to-discover-scrape-targets) somehow.
+
 ## Open questions
 
 - Are we sure that the service is going to be restarted if the `hostport` changes?
 - If the service restarts, are we guaranteed to keep the extra data?
 - How can we make it so Prometheus is never restarted, but instead call its
   reload-config endpoint when something changes in the configuration?
+  + Use service discovery
 - Is it possible to update the configuration externally?
+  + Use service discovery, again
