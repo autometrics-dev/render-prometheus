@@ -22,6 +22,9 @@ CONF_SCRAPE_CONFIGS = "scrape_configs"
 CONF_SCRAPE_INTERVAL = "scrape_interval"
 CONF_SCRAPE_TIMEOUT = "scrape_timeout"
 CONF_STATIC_CONFIGS = "static_configs"
+CONF_SCHEME = "scheme"
+CONF_HTTP_INSECURE = "http"
+CONF_HTTPS = "https"
 CONF_RULE_FILES = "rule_files"
 CONF_GLOBAL = "global"
 CONF_TARGETS = "targets"
@@ -43,7 +46,11 @@ def add_scrape_config(config: Dict[str, Any], name: str, target: str) -> Dict[st
     if config.get(CONF_SCRAPE_CONFIGS) is None:
         config[CONF_SCRAPE_CONFIGS] = []
     config[CONF_SCRAPE_CONFIGS].append(
-        {CONF_JOB_NAME: name.lower(), CONF_STATIC_CONFIGS: [{CONF_TARGETS: [target]}]}
+        {
+            CONF_JOB_NAME: name.lower(),
+            CONF_STATIC_CONFIGS: [{CONF_TARGETS: [target]}],
+            CONF_SCHEME: CONF_HTTPS,
+        }
     )
     return config
 
@@ -95,6 +102,7 @@ def main():
     # - Authentication parameters (both to connect to Prometheus, and for Prometheus to connect to targets)
     # - Rule files list appending
     # - Alerting rules appending
+    # - Choose the scheme for targets.
     args = parser.parse_args()
     config = generate_prometheus_yml()
     create_folders()
