@@ -3,19 +3,27 @@
 """
 Prometheus configuration generator
 
-This script generates a prometheus configuration following environment variables and command-line flags.
+This script generates a prometheus configuration following environment variables and
+then runs Prometheus passing all the command-line arguments.
 """
 
-import argparse
 import os
 import subprocess
 import sys
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List, Union, Optional
 import urllib.parse
 import yaml
 
+try:
+    from yaml import CDumper as Dumper
+except ImportError:
+    from yaml import Dumper
 
-VAR_NAME_PREFIX = "PROM_TARGET_"
+
+VAR_HOST_NAME_PREFIX = "PROM_TARGET_"
+VAR_OPTS_NAME_PREFIX = "PROM_OPTS_"
+VAR_OPTS_NAME = "PROM_GLOBAL_OPTS"
+
 CONF_EXTERNAL_LABELS = "external_labels"
 CONF_MONITOR = "monitor"
 CONF_SCRAPE_CONFIGS = "scrape_configs"
@@ -30,50 +38,308 @@ CONF_GLOBAL = "global"
 CONF_TARGETS = "targets"
 CONF_JOB_NAME = "job_name"
 
+CONF_LIST_VARIABLES = [
+    CONF_RULE_FILES,
+    "scrape_config_files",
+    CONF_SCRAPE_CONFIGS,
+    "alert_relabel_configs",
+    "alertmanagers",
+    "remote_write",
+    "remote_read",
+    "proxy_connect_header",
+    "azure_sd_configs",
+    "consul_sd_configs",
+    "digitalocean_sd_configs",
+    "docker_sd_configs",
+    "dockerswarm_sd_configs",
+    "dns_sd_configs",
+    "ec2_sd_configs",
+    "eureka_sd_configs",
+    "file_sd_configs",
+    "gce_sd_configs",
+    "hertzner_sd_configs",
+    "http_sd_configs",
+    "ionos_sd_configs",
+    "kubernetes_sd_configs",
+    "kuma_sd_configs",
+    "lightsail_sd_configs",
+    "linode_sd_configs",
+    "marathon_sd_configs",
+    "nerve_sd_configs",
+    "nomad_sd_configs",
+    "openstack_sd_configs",
+    "ovhcloud_sd_configs",
+    "puppetdb_sd_configs",
+    "scaleway_sd_configs",
+    "serverset_sd_configs",
+    "triton_sd_configs",
+    "uyuni_sd_configs",
+    CONF_STATIC_CONFIGS,
+    "relabel_configs",
+    "metric_relabel_configs",
+    "scopes",
+    "services",
+    "tags",
+    "filters",
+]
 
-def default_config() -> Dict[str, Any]:
-    config = {}
-    config[CONF_RULE_FILES] = ["/etc/prometheus/rules/*.yml"]
+
+def _is_float(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_int(s: str) -> bool:
+    try:
+        int(s)
+        return True
+    except ValueError:
+        return False
+
+
+# Dictionary wrapper that deals with '.' in keys as nested dictionnaries.
+# Adapted from https://stackoverflow.com/a/3798595
+class DotDict(dict):
+    def __init__(self, value=None):
+        if value is None:
+            pass
+        elif isinstance(value, dict):
+            for key in value:
+                self.__setitem__(key, value[key])
+        else:
+            raise TypeError("expected dict")
+
+    def _find_key_target(
+        self, key
+    ) -> Tuple[Union["DotDict", List[Any]], Optional[str]]:
+        if "." in key:
+            myKey, restOfKey = key.split(".", 1)
+            if _is_int(myKey):
+                if not isinstance(self, list):
+                    raise KeyError(
+                        f"cannot set {myKey}-th element in non-list ({self})"
+                    )
+                index = int(myKey)
+                if index == len(self):
+                    self.append(None)
+                target = self[int(myKey)]
+            else:
+                target = self.setdefault(myKey, DotDict())
+
+            return (target, restOfKey)
+        else:
+            return (self, None)
+
+    def __setitem__(self, key, value):
+        target, restOfKey = self._find_key_target(key)
+
+        if restOfKey is not None:
+            if isinstance(target, DotDict):
+                target[restOfKey] = value
+                return
+            if isinstance(target, list):
+                if "." in restOfKey:
+                    index, restOfKey = restOfKey.split(".", 1)
+                    if int(index) == len(target):
+                        # NOTE: this assumes that the configurations have no "lists of lists"
+                        inner_value = DotDict()
+                        inner_value[restOfKey] = value
+                        target.append(inner_value)
+                        return
+                    target[int(index)][restOfKey] = value
+                else:
+                    index = int(restOfKey)
+                    if index == len(target):
+                        target.append(value)
+                        return
+                    target[int(restOfKey)] = value
+
+                return
+
+            raise KeyError(f'cannot set "{restOfKey}" from "{key}" ({target})')
+        else:
+            if isinstance(value, dict) and not isinstance(value, DotDict):
+                value = DotDict(value)
+            if isinstance(key, int):
+                raise KeyError(
+                    f"cannot append a value as current item {self} is not a list"
+                )
+            dict.__setitem__(self, key, value)
+
+    def __getitem__(self, key):
+        if "." not in key:
+            return dict.__getitem__(self, key)
+        myKey, restOfKey = key.split(".", 1)
+        if _is_int(myKey):
+            if not isinstance(self, list):
+                raise KeyError(f"cannot set {myKey}-th element in non-list ({self})")
+            target = self[int(myKey)]
+        else:
+            target = dict.__getitem__(self, myKey)
+
+        if isinstance(target, DotDict):
+            return target[restOfKey]
+        if isinstance(target, list):
+            if "." in restOfKey:
+                index, restOfKey = restOfKey.split(".", 1)
+                return target[int(index)][restOfKey]
+            # If there's no '.' in the end of the key, we assume it's just the index
+            # of the list
+            return target[int(restOfKey)]
+
+        raise KeyError(f'cannot get "{target}" in "{myKey}" ({target})')
+
+    def __contains__(self, key):
+        if "." not in key:
+            return dict.__contains__(self, key)
+        myKey, restOfKey = key.split(".", 1)
+        target = dict.__getitem__(self, myKey)
+        if not isinstance(target, DotDict):
+            return False
+        return restOfKey in target
+
+    def setdefault(self, key, default):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    __setattr__ = __setitem__
+    __getattr__ = __getitem__
+
+
+def DotDict_representer(dumper: Dumper, data: DotDict):
+    return dumper.represent_dict(dict.items(data))
+
+
+def default_config() -> DotDict:
+    config = DotDict()
     config[CONF_GLOBAL] = {
         CONF_SCRAPE_INTERVAL: "10s",
         CONF_SCRAPE_TIMEOUT: "5s",
         CONF_EXTERNAL_LABELS: {CONF_MONITOR: "autometrics"},
     }
+    config[CONF_RULE_FILES] = ["/etc/prometheus/rules/*.yml"]
     return config
 
 
-def add_scrape_config(config: Dict[str, Any], name: str, target: str) -> Dict[str, Any]:
-    if config.get(CONF_SCRAPE_CONFIGS) is None:
-        config[CONF_SCRAPE_CONFIGS] = []
-    config[CONF_SCRAPE_CONFIGS].append(
+def add_scrape_config(
+    config: DotDict, name: str, targets: List[str], options: Dict[str, Any]
+) -> DotDict:
+    target_config = DotDict(
         {
             CONF_JOB_NAME: name.lower(),
-            CONF_STATIC_CONFIGS: [{CONF_TARGETS: [target]}],
-            CONF_SCHEME: CONF_HTTPS,
+            CONF_STATIC_CONFIGS: [{CONF_TARGETS: targets}],
         }
     )
+    for key, value in options.items():
+        target_config = _add_kv_to_config(target_config, key, value)
+
+    if config.get(CONF_SCRAPE_CONFIGS) is None:
+        config[CONF_SCRAPE_CONFIGS] = []
+    config[CONF_SCRAPE_CONFIGS].append(target_config)
+
     return config
 
 
-def parse_target(var_name: str, var_value: str) -> Tuple[str, str]:
-    if not var_name.startswith(VAR_NAME_PREFIX):
-        raise ValueError(
-            f"{var_name} is not a valid environment variable (does not start with {VAR_NAME_PREFIX})."
-        )
-    try:
-        urllib.parse.urlsplit("//" + var_value)
-    except ValueError as e:
-        raise ValueError(f"{var_value} is not a valid IP address: {e}")
+def _add_kv_to_config(config: DotDict, dot_separated_key: str, value: str) -> DotDict:
+    # If value was actually quoted, we want it as a string all the time
+    if value.startswith('"') and value.endswith('"'):
+        typed_value = value[1:-1]
+    elif value.lower() == "true":
+        typed_value = True
+    elif value.lower() == "false":
+        typed_value = False
+    elif _is_int(value):
+        typed_value = int(value)
+    elif _is_float(value):
+        typed_value = float(value)
+    else:
+        typed_value = value
 
-    return (var_name.removeprefix(VAR_NAME_PREFIX), var_value)
+    tail_key = dot_separated_key.rsplit(".", maxsplit=1)[-1]
+
+    current_val = config.get(dot_separated_key, None)
+    if isinstance(current_val, dict):
+        raise ValueError(
+            f"Cannot apply the config value to a non-empty set: {dot_separated_key} -> {current_val}"
+        )
+    elif isinstance(current_val, list):
+        config[dot_separated_key].append(typed_value)
+    elif tail_key in CONF_LIST_VARIABLES:
+        if config[dot_separated_key] is None:
+            config[dot_separated_key] = []
+        config[dot_separated_key].append(typed_value)
+    else:
+        config[dot_separated_key] = typed_value
+
+    return config
+
+
+def parse_target(
+    var_name: str, var_value: str
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    if not var_name.startswith(VAR_HOST_NAME_PREFIX):
+        raise ValueError(
+            f"{var_name} is not a valid environment variable (does not start with {VAR_HOST_NAME_PREFIX})."
+        )
+    target_name = var_name.removeprefix(VAR_HOST_NAME_PREFIX)
+
+    targets = var_value.split(";")
+    for target in targets:
+        try:
+            urllib.parse.urlsplit("//" + target)
+        except ValueError as e:
+            raise ValueError(f"{target} is not a valid IP address: {e}")
+
+    opts = {}
+    if f"{VAR_OPTS_NAME_PREFIX}{target_name}" in os.environ:
+        opts = _parse_opts(os.environ[f"{VAR_OPTS_NAME_PREFIX}{target_name}"])
+
+    return (target_name, targets, opts)
+
+
+def _parse_opts(var_value: str) -> Dict[str, Any]:
+    opts = var_value.split(";")
+    options = {}
+    for option in opts:
+        option_name, option_value, *_ = option.split("=", 1)
+        options[option_name] = option_value
+
+    return options
+
+
+def _parse_global_opts() -> Dict[str, Any]:
+    opts_list = os.environ.get(VAR_OPTS_NAME, None)
+
+    if opts_list is None:
+        return {}
+
+    options = {}
+    for option in opts_list.split(";"):
+        name, value, *_ = option.split("=", 1)
+        options[name] = value
+
+    return options
 
 
 def generate_prometheus_yml() -> str:
     config = default_config()
+
+    global_opts = _parse_global_opts()
+    for key, value in global_opts.items():
+        config = _add_kv_to_config(config, key, value)
+
     for key in os.environ:
-        if key.startswith(VAR_NAME_PREFIX):
-            target_name, target_location = parse_target(key, os.environ[key])
-            config = add_scrape_config(config, target_name, target_location)
+        if key.startswith(VAR_HOST_NAME_PREFIX):
+            target_name, target_locations, target_opts = parse_target(
+                key, os.environ[key]
+            )
+            config = add_scrape_config(
+                config, target_name, target_locations, target_opts
+            )
     return yaml.dump(config)
 
 
@@ -89,37 +355,51 @@ def create_folders():
         pass
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    # TODO: add arguments to do a bunch of things:
-    # - Whether to activate or not the web.enable-admin-ui
-    # - The port to listen to should be configurable instead of env only
-    # - A way to add a listener to reload config on change
-    # - A way to read the targets from watched file rather than environment variables
-    # - A way to choose the directory where the prometheus.yml should be created
-    # - Scrape interval and timeout
-    # - The name of the monitor in the added labels
-    # - Authentication parameters (both to connect to Prometheus, and for Prometheus to connect to targets)
-    # - Rule files list appending
-    # - Alerting rules appending
-    # - Choose the scheme for targets.
-    args = parser.parse_args()
-    config = generate_prometheus_yml()
+def run_prom(config: str, args: List[str]):
     create_folders()
     with open("/etc/prometheus/prometheus.yml", "w") as f:
         f.write(config)
     port = os.environ.get("PORT", 9090)
+    command = [
+        "prometheus",
+        "--config.file=/etc/prometheus/prometheus.yml",
+        f"--web.listen-address=:{port}",
+    ]
+    command.extend(args)
     subprocess.run(
-        [
-            "prometheus",
-            "--config.file=/etc/prometheus/prometheus.yml",
-            f"--web.listen-address=:{port}",
-        ],
+        command,
         check=True,
         stdout=sys.stdout,
         stderr=sys.stderr,
     )
 
+
+def main():
+    args = sys.argv[1:]
+    if any(x.startswith("--web.listen-address=") for x in args):
+        print(
+            "Error: Do not try to configure web.listen-address through flags. Only use the PORT environment variable, which should be the value coming from Render."
+        )
+        sys.exit(1)
+    if any(x.startswith("--config.file=") for x in args):
+        print(
+            "Error: Do not try to configure config.file through flags. Only use the special environment variables PROM_TARGET_*, PROM_OPTS_*, and PROM_GLOBAL_OPTS, which should be values set either in Blueprints or in service settings."
+        )
+        sys.exit(1)
+    try:
+        config = generate_prometheus_yml()
+        print(f"Generated configuration follows:\n{config}\n-----\n\n")
+    except Exception as e:
+        raise RuntimeError("Configuration error") from e
+
+    try:
+        run_prom(config, args)
+    except Exception as e:
+        raise RuntimeError("Prometheus error") from e
+
+
+# DotDict helper type gets always dumped as a normal dict in yaml.
+yaml.add_representer(DotDict, DotDict_representer)
 
 if __name__ == "__main__":
     main()
