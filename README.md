@@ -122,14 +122,18 @@ inactivity, it makes everything unreliable:
   [scrape_timeout](https://prometheus.io/docs/prometheus/latest/configuration/configuration)
 
 
-## TODO
+## Following tasks/Tentative roadmap
 
-- [ ] Set up [file-based service discovery](https://prometheus.io/docs/guides/file-sd/#use-file-based-service-discovery-to-discover-scrape-targets) somehow.
+- [ ] Set up [file-based service
+      discovery](https://prometheus.io/docs/guides/file-sd/#use-file-based-service-discovery-to-discover-scrape-targets)
+      somehow.
 
 ## Open questions
 
 - Are we sure that the service is going to be restarted if the `hostport` changes?
 - If the service restarts, are we guaranteed to keep the extra data?
+  + It should be handled by attaching disks to the service. Meaning it's only available
+    for paying customers of Render for now.
 - How can we make it so Prometheus is never restarted, but instead call its
   reload-config endpoint when something changes in the configuration?
   + Use service discovery
